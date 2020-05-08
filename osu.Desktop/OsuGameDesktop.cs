@@ -86,6 +86,9 @@ namespace osu.Desktop
                 case RuntimeInfo.Platform.Windows:
                     return new SquirrelUpdateManager();
 
+                case RuntimeInfo.Platform.Linux:
+                    return new AppImageUpdateManager();
+
                 default:
                     return new SimpleUpdateManager();
             }

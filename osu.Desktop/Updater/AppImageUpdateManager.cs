@@ -2,6 +2,7 @@
 // See the LICENCE file in the repository root for full licence text.
 
 using System;
+using System.IO;
 using System.Threading.Tasks;
 using osu.Framework.Allocation;
 using osu.Framework.Graphics;
@@ -18,10 +19,11 @@ using Squirrel;
 
 namespace osu.Desktop.Updater
 {
-    public class SquirrelUpdateManager : osu.Game.Updater.UpdateManager
+    public class AppImageUpdateManager : osu.Game.Updater.UpdateManager
     {
-        private UpdateManager updateManager;
+        private Appimage.Updater.Updater updateManager;
         private NotificationOverlay notificationOverlay;
+        private bool isDeployedBuild;
 
         public Task PrepareUpdateAsync() => UpdateManager.RestartAppWhenExited();
 
@@ -34,61 +36,85 @@ namespace osu.Desktop.Updater
 
             if (game.IsDeployedBuild)
             {
+                isDeployedBuild = true;
                 Splat.Locator.CurrentMutable.Register(() => new UpdateLogger(logger), typeof(Splat.ILogger));
                 Schedule(() => Task.Run(() => checkForUpdateAsync()));
             }
         }
 
-        private async void checkForUpdateAsync(bool useDeltaPatching = true, UpdateProgressNotification notification = null)
+        private void checkForUpdateAsync(AppImageUpdateManager.UpdateProgressNotification notification = null)
         {
             // should we schedule a retry on completion of this check?
             bool scheduleRecheck = true;
 
             try
             {
-                if (updateManager == null) updateManager = await UpdateManager.GitHubUpdateManager(@"https://github.com/ppy/osu", @"osulazer", null, null, true);
+                if (updateManager == null) updateManager = new Appimage.Updater.Updater(Environment.GetEnvironmentVariable("APPIMAGE"), true);
 
-                var info = await updateManager.CheckForUpdate(!useDeltaPatching);
-                if (info.ReleasesToApply.Count == 0)
+                bool updateAvailable = false;
+                updateManager.CheckForChanges(ref updateAvailable, 0);
+
+                // Check if there is any message to log.
+                while (updateManager.NextStatusMessage(out string nextMessage))
+                    osu.Framework.Logging.Logger.Log(nextMessage);
+
+                if (!updateAvailable)
                     // no updates available. bail and retry later.
                     return;
 
                 if (notification == null)
                 {
-                    notification = new UpdateProgressNotification(this) { State = ProgressNotificationState.Active };
+                    notification = new AppImageUpdateManager.UpdateProgressNotification(this) { State = ProgressNotificationState.Active };
                     Schedule(() => notificationOverlay.Post(notification));
                 }
 
                 notification.Progress = 0;
-                notification.Text = @"Downloading update...";
+                notification.Text = @"Downloading and installing update...";
 
                 try
                 {
-                    await updateManager.DownloadReleases(info.ReleasesToApply, p => notification.Progress = p / 100f);
+                    updateManager.Start();
 
-                    notification.Progress = 0;
-                    notification.Text = @"Installing update...";
+                    while (!updateManager.IsDone)
+                    {
+                        double progress = 0d;
 
-                    await updateManager.ApplyReleases(info, p => notification.Progress = p / 100f);
+                        if (updateManager.Progress(ref progress))
+                        {
+                            notification.Progress = (float)progress;
+                        }
+
+                        // Check if there is any message to log.
+                        while (updateManager.NextStatusMessage(out string nextMessage))
+                            osu.Framework.Logging.Logger.Log(nextMessage);
+                    }
+
+                    if (updateManager.HasError)
+                    {
+                        while (updateManager.NextStatusMessage(out string nextMessage))
+                            osu.Framework.Logging.Logger.Log(nextMessage);
+
+                        throw new AppImageNativeException();
+                    }
+
+                    osu.Desktop.Updater.Appimage.Updater.Updater.ValidationState state = updateManager.ValidateSignature();
+
+                    if (isDeployedBuild && state >= osu.Desktop.Updater.Appimage.Updater.Updater.ValidationState.VALIDATION_FAILED)
+                    {
+                        string msg = osu.Desktop.Updater.Appimage.Updater.Updater.SignatureValidationMessage(state);
+                        var exception = new IOException(msg);
+
+                        osu.Framework.Logging.Logger.Error(exception, msg);
+
+                        throw exception;
+                    }
 
                     notification.State = ProgressNotificationState.Completed;
                 }
                 catch (Exception e)
                 {
-                    if (useDeltaPatching)
-                    {
-                        logger.Add(@"delta patching failed; will attempt full download!");
-
-                        // could fail if deltas are unavailable for full update path (https://github.com/Squirrel/Squirrel.Windows/issues/959)
-                        // try again without deltas.
-                        checkForUpdateAsync(false, notification);
-                        scheduleRecheck = false;
-                    }
-                    else
-                    {
-                        notification.State = ProgressNotificationState.Cancelled;
-                        osu.Framework.Logging.Logger.Error(e, @"update failed!");
-                    }
+                    notification.State = ProgressNotificationState.Cancelled;
+                    osu.Framework.Logging.Logger.Error(e, @"update failed!");
                 }
             }
             catch (Exception)
@@ -113,10 +139,10 @@ namespace osu.Desktop.Updater
 
         private class UpdateProgressNotification : ProgressNotification
         {
-            private readonly SquirrelUpdateManager updateManager;
+            private readonly AppImageUpdateManager updateManager;
             private OsuGame game;
 
-            public UpdateProgressNotification(SquirrelUpdateManager updateManager)
+            public UpdateProgressNotification(AppImageUpdateManager updateManager)
             {
                 this.updateManager = updateManager;
             }
@@ -156,6 +182,14 @@ namespace osu.Desktop.Updater
                         Size = new Vector2(20),
                     }
                 });
+            }
+        }
+
+        public class AppImageNativeException : Exception
+        {
+            internal AppImageNativeException()
+                : base("An exception occured in the native library used for updating.")
+            {
             }
         }
     }
